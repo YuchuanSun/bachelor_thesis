@@ -1,0 +1,22 @@
+# 模型使用BERT和文本描述的验证报告
+
+## 1. 验证结果
+- ✓ 模型成功加载了BERT-base-chinese预训练权重
+- ✓ 模型能够处理文本输入并生成文本嵌入
+- ✓ 使用文本+图像的性能优于仅使用图像
+
+## 2. 可视化结果
+- 文本注意力热力图: E:\AlgaeSiameseNetwork\algae_project\bachelor_thesis\results\attention_heatmap.png
+- 文本-图像相似度矩阵: E:\AlgaeSiameseNetwork\algae_project\bachelor_thesis\results\text_image_similarity.png
+- 文本引导的图像注意力: E:\AlgaeSiameseNetwork\algae_project\bachelor_thesis\results\text_guided_attention.png
+- 联合嵌入空间可视化: E:\AlgaeSiameseNetwork\algae_project\bachelor_thesis\results\joint_embedding_space.png
+
+## 3. 结论
+模型确实使用了BERT和文本描述来识别图片。通过以下证据可以证明：
+1. 模型加载了BERT-base-chinese预训练权重
+2. 模型能够处理文本输入并生成文本嵌入
+3. 使用文本+图像的性能优于仅使用图像
+4. 文本注意力热力图显示BERT对文本中不同词的注意力权重
+5. 文本-图像相似度矩阵显示不同文本与不同图像之间的相似度
+6. 文本引导的图像注意力热力图显示模型根据文本关注图像的不同区域
+7. 联合嵌入空间可视化显示文本和图像在嵌入空间中的分布
