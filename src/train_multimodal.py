@@ -1,20 +1,26 @@
-# 双塔模型训练与零样本验证逻辑
-
 import os
 import sys
 import numpy as np
 import torch
 import torch.optim as optim
+import torch.nn.functional as F
 from torch.amp import autocast, GradScaler
 from sklearn.metrics import accuracy_score, f1_score
 from tqdm import tqdm
+import matplotlib.pyplot as plt
+from PIL import Image
+from torchvision import transforms
+from datetime import datetime
+import pandas as pd
 
-# 添加项目根目录到Python路径
+plt.rcParams['font.sans-serif'] = ['SimHei']
+plt.rcParams['axes.unicode_minus'] = False
+
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from configs.default_config import (
     DEVICE, BATCH_SIZE, GRADIENT_ACCUMULATION_STEPS, EPOCHS, LR, WEIGHT_DECAY,
-    USE_AMP, N_FOLDS, NUM_UNSEEN_SPECIES, ALGAE_DESCRIPTIONS, MODEL_SAVE_DIR
+    USE_AMP, N_FOLDS, NUM_UNSEEN_SPECIES, ALGAE_DESCRIPTIONS, MODEL_SAVE_DIR, RESULT_DIR
 )
 from dataset import AlgaeMultimodalDataset, get_stratified_kfold, get_data_loaders
 from models.multimodal import MultimodalModel
@@ -22,18 +28,6 @@ from loss import InfoNCELoss
 from transformers import BertTokenizer
 
 def train_epoch(model, train_loader, optimizer, loss_fn, scaler, gradient_accumulation_steps):
-    """
-    训练一个epoch
-    Args:
-        model: 模型
-        train_loader: 训练数据加载器
-        optimizer: 优化器
-        loss_fn: 损失函数
-        scaler: 梯度缩放器
-        gradient_accumulation_steps: 梯度累加步数
-    Returns:
-        平均损失
-    """
     model.train()
     total_loss = 0
     step = 0
@@ -45,19 +39,14 @@ def train_epoch(model, train_loader, optimizer, loss_fn, scaler, gradient_accumu
         attention_mask = attention_mask.to(DEVICE)
 
         with autocast(device_type='cuda', enabled=USE_AMP):
-            # 前向传播
             image_embeds, text_embeds = model(image_tensor, input_ids, attention_mask)
-            # 计算损失
             loss = loss_fn(image_embeds, text_embeds)
-            # 梯度累加
             loss = loss / gradient_accumulation_steps
 
-        # 反向传播
         scaler.scale(loss).backward()
         total_loss += loss.item() * gradient_accumulation_steps
         step += 1
 
-        # 每gradient_accumulation_steps步更新一次参数
         if step % gradient_accumulation_steps == 0:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -68,24 +57,12 @@ def train_epoch(model, train_loader, optimizer, loss_fn, scaler, gradient_accumu
     return total_loss / len(train_loader)
 
 def zero_shot_validate(model, val_loader, tokenizer, unseen_species):
-    """
-    零样本验证
-    Args:
-        model: 模型
-        val_loader: 验证数据加载器
-        tokenizer: BERT分词器
-        unseen_species: 未见过的物种ID列表
-    Returns:
-        准确率和F1-Score
-    """
     model.eval()
     all_preds = []
     all_labels = []
 
-    # 准备文本描述嵌入
     text_embeds_list = []
     for label, desc in ALGAE_DESCRIPTIONS.items():
-        # 处理文本
         text_inputs = tokenizer(
             desc,
             max_length=512,
@@ -96,12 +73,10 @@ def zero_shot_validate(model, val_loader, tokenizer, unseen_species):
         input_ids = text_inputs['input_ids'].to(DEVICE)
         attention_mask = text_inputs['attention_mask'].to(DEVICE)
 
-        # 获取文本嵌入
         with torch.no_grad():
             _, text_emb = model(input_ids=input_ids, attention_mask=attention_mask)
             text_embeds_list.append(text_emb)
 
-    # 合并文本嵌入
     text_embeds = torch.cat(text_embeds_list, dim=0)
 
     with torch.no_grad():
@@ -110,24 +85,17 @@ def zero_shot_validate(model, val_loader, tokenizer, unseen_species):
             image_tensor = image_tensor.to(DEVICE)
             label_id = label_id.cpu().numpy()
 
-            # 过滤出未见过的物种
             unseen_mask = np.isin(label_id, unseen_species)
             if not np.any(unseen_mask):
                 continue
 
-            # 获取图像嵌入
-            image_embeds, _ = model(image=image_tensor[unseen_mask])
-
-            # 计算相似度
-            similarity = torch.matmul(image_embeds, text_embeds.t())
-            # 预测标签
+            image_embeds_batch, _ = model(image=image_tensor[unseen_mask])
+            similarity = torch.matmul(image_embeds_batch, text_embeds.t())
             preds = torch.argmax(similarity, dim=1).cpu().numpy()
 
-            # 收集预测和真实标签
             all_preds.extend(preds)
             all_labels.extend(label_id[unseen_mask])
 
-    # 计算指标
     if len(all_labels) > 0:
         accuracy = accuracy_score(all_labels, all_preds)
         f1 = f1_score(all_labels, all_preds, average='macro')
@@ -137,32 +105,85 @@ def zero_shot_validate(model, val_loader, tokenizer, unseen_species):
 
     return accuracy, f1
 
+def generate_zeroshot_visualization(model, sample_image_path, tokenizer, species_names, save_path):
+    model.eval()
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+
+    texts = [ALGAE_DESCRIPTIONS[i] for i in range(len(ALGAE_DESCRIPTIONS))]
+    
+    raw_img = Image.open(sample_image_path).convert('RGB')
+    img_tensor = transform(raw_img).unsqueeze(0).to(DEVICE)
+
+    with torch.no_grad():
+        img_feat = model(image=img_tensor)[0]
+        img_feat = F.normalize(img_feat, p=2, dim=1)
+        
+        text_inputs = tokenizer(texts, padding=True, truncation=True, max_length=128, return_tensors="pt").to(DEVICE)
+        txt_output = model.text_encoder(input_ids=text_inputs['input_ids'], attention_mask=text_inputs['attention_mask'])
+        txt_feat = model.text_proj(txt_output.pooler_output)
+        txt_feat = F.normalize(txt_feat, p=2, dim=1)
+        
+        similarities = torch.matmul(img_feat, txt_feat.T).squeeze(0).cpu().numpy()
+
+    sorted_indices = similarities.argsort()[-5:][::-1]
+    top_species = [species_names[i] for i in sorted_indices]
+    top_scores = [similarities[i] for i in sorted_indices]
+
+    colors = ['#e74c3c' if i == 0 else '#95a5a6' for i in range(len(top_scores))]
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5), gridspec_kw={'width_ratios': [1, 1.5]})
+    
+    ax1.imshow(raw_img)
+    ax1.axis('off')
+    ax1.set_title(f"Zero-shot Input Image\nTrue Label: {species_names[sorted_indices[0]]}", fontsize=14, fontweight='bold')
+    
+    bars = ax2.barh(top_species[::-1], top_scores[::-1], color=colors[::-1])
+    ax2.set_xlabel('Cosine Similarity', fontsize=12)
+    ax2.set_title('Text Dictionary Retrieval Results (Top-5)', fontsize=14, fontweight='bold')
+    ax2.set_xlim(0, 1.0)
+    
+    for bar in bars:
+        ax2.text(bar.get_width() + 0.02, bar.get_y() + bar.get_height()/2, 
+                 f'{bar.get_width():.3f}', va='center', fontsize=11)
+                
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"Zero-shot visualization saved to: {save_path}")
+
+def export_training_results_to_excel(results, filename):
+    df = pd.DataFrame(results)
+    df.to_excel(filename, index=False)
+    print(f"Training results exported to: {filename}")
+
 def main():
-    """主函数"""
-    # 创建模型保存目录
     os.makedirs(MODEL_SAVE_DIR, exist_ok=True)
+    os.makedirs(RESULT_DIR, exist_ok=True)
 
-    # 初始化分词器
     tokenizer = BertTokenizer.from_pretrained('bert-base-chinese')
-
-    # 获取项目根目录
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-    # 加载数据集
     dataset = AlgaeMultimodalDataset(os.path.join(project_root, 'data'))
+    species_names = [f"Species_{i}" for i in range(len(ALGAE_DESCRIPTIONS))]
 
-    # 交叉验证
-    print(f"使用 {N_FOLDS} 折交叉验证")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    excel_filename = os.path.join(RESULT_DIR, f"training_results_{timestamp}.xlsx")
+
+    all_training_results = []
+
+    print(f"Using {N_FOLDS}-fold cross-validation")
     folds = get_stratified_kfold(dataset.data, n_splits=N_FOLDS)
 
     for fold_idx, (train_idx, val_idx) in enumerate(folds):
         print(f"\n=== Fold {fold_idx + 1}/{N_FOLDS} ===")
 
-        # 分割数据
         train_data = [dataset.data[i] for i in train_idx]
         val_data = [dataset.data[i] for i in val_idx]
 
-        # 提取未见过的物种（从验证集中随机选择2个）
         val_labels = [item['label'] for item in val_data]
         unique_labels = list(set(val_labels))
         if len(unique_labels) >= NUM_UNSEEN_SPECIES:
@@ -172,8 +193,6 @@ def main():
 
         print(f"Unseen species: {unseen_species}")
 
-        # 创建数据加载器
-        # 这里简化处理，实际项目中可能需要创建临时目录或使用Subset
         train_loader = torch.utils.data.DataLoader(
             torch.utils.data.Subset(dataset, train_idx),
             batch_size=BATCH_SIZE,
@@ -188,46 +207,71 @@ def main():
             num_workers=4
         )
 
-        # 初始化模型
         model = MultimodalModel().to(DEVICE)
 
-        # 初始化优化器
         optimizer = optim.AdamW(
             filter(lambda p: p.requires_grad, model.parameters()),
             lr=LR,
             weight_decay=WEIGHT_DECAY
         )
 
-        # 初始化损失函数
         loss_fn = InfoNCELoss()
-
-        # 初始化梯度缩放器
         scaler = GradScaler(enabled=USE_AMP)
 
-        # 训练循环
         best_f1 = 0.0
+        best_accuracy = 0.0
+        fold_results = []
 
         for epoch in range(EPOCHS):
             print(f"\nEpoch {epoch + 1}/{EPOCHS}")
 
-            # 训练
             train_loss = train_epoch(
                 model, train_loader, optimizer, loss_fn, scaler, GRADIENT_ACCUMULATION_STEPS
             )
             print(f"Train Loss: {train_loss:.4f}")
 
-            # 零样本验证
             accuracy, f1 = zero_shot_validate(model, val_loader, tokenizer, unseen_species)
             print(f"Zero-shot Accuracy: {accuracy:.4f}, F1-Score: {f1:.4f}")
 
-            # 保存最佳模型
+            fold_results.append({
+                'Fold': fold_idx + 1,
+                'Epoch': epoch + 1,
+                'Train_Loss': train_loss,
+                'Zero_shot_Accuracy': accuracy,
+                'Zero_shot_F1': f1
+            })
+
             if f1 > best_f1:
                 best_f1 = f1
-                model_path = os.path.join(MODEL_SAVE_DIR, f'multimodal_model_fold{fold_idx + 1}.pth')
+                best_accuracy = accuracy
+                model_path = os.path.join(MODEL_SAVE_DIR, f'multimodal_model_fold{fold_idx + 1}_{timestamp}.pth')
                 torch.save(model.state_dict(), model_path)
                 print(f"Saved best model to {model_path}")
 
-        print(f"\nFold {fold_idx + 1} completed. Best F1-Score: {best_f1:.4f}")
+        print(f"\nFold {fold_idx + 1} completed. Best F1-Score: {best_f1:.4f}, Best Accuracy: {best_accuracy:.4f}")
+
+        all_training_results.extend(fold_results)
+
+        viz_save_path = os.path.join(RESULT_DIR, f'zeroshot_visualization_fold{fold_idx + 1}_{timestamp}.png')
+        sample_images = [item['image_path'] for item in val_data if item['label'] in unseen_species]
+        if sample_images:
+            generate_zeroshot_visualization(model, sample_images[0], tokenizer, species_names, viz_save_path)
+
+        fold_summary = {
+            'Model': f'multimodal_model_fold{fold_idx + 1}_{timestamp}',
+            'Fold': fold_idx + 1,
+            'Best_F1_Score': best_f1,
+            'Best_Accuracy': best_accuracy,
+            'Unseen_Species': str(list(unseen_species)),
+            'Total_Parameters': sum(p.numel() for p in model.parameters()),
+            'Trainable_Parameters': sum(p.numel() for p in model.parameters() if p.requires_grad)
+        }
+        all_training_results.append(fold_summary)
+
+    export_training_results_to_excel(all_training_results, excel_filename)
+
+    print(f"\n=== Training Complete ===")
+    print(f"All results saved to: {excel_filename}")
 
 if __name__ == '__main__':
     main()

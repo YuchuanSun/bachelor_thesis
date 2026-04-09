@@ -23,7 +23,7 @@ DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 # 训练参数
 BATCH_SIZE = 16  # 适配显存
 GRADIENT_ACCUMULATION_STEPS = 4  # 梯度累加步数
-EPOCHS = 100
+EPOCHS = 50
 LR = 5e-5
 WEIGHT_DECAY = 1e-4
 
